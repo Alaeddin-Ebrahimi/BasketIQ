@@ -1,0 +1,148 @@
+# BasketIQ: Smart Retail Insights & Market Basket Analysis App (Apache Spark Version)
+# --------------------------------------------------------------
+# This script reads store bills (CSV/Excel), generates summary sales reports,
+# highlights best-sellers, performs market basket analysis, and includes a chatbot
+# powered by a free ChatGPT-compatible LLM API (OpenAI or similar).
+# For small stores using Apache Spark for scalable analytics.
+
+import sys
+import pandas as pd
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, count, sum as spark_sum
+from mlxtend.frequent_patterns import apriori, association_rules
+import requests
+
+# ----------- CONFIGURATION -----------
+OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"  # Change to your free LLM endpoint
+OPENAI_API_KEY = "YOUR_FREE_OPENAI_API_KEY"  # Place your free key here
+
+# ----------- DATA INGESTION -----------
+
+def read_bills(spark, file_path):
+    if file_path.endswith('.csv'):
+        df = spark.read.csv(file_path, header=True, inferSchema=True)
+    elif file_path.endswith('.xlsx'):
+        # For Excel, use pandas then convert to Spark DF
+        pdf = pd.read_excel(file_path)
+        df = spark.createDataFrame(pdf)
+    else:
+        raise ValueError("Unsupported file format. Use CSV or Excel.")
+    return df
+
+# ----------- SUMMARY REPORTS -----------
+
+def sales_summary(df):
+    total_sales = df.count()
+    product_sales = df.groupBy("product").agg(count("*").alias("sales_count"))
+    top_products = product_sales.orderBy(col("sales_count").desc()).limit(10)
+    return {
+        "total_sales": total_sales,
+        "top_products": top_products.toPandas()
+    }
+
+def sales_by_date(df):
+    # Example: Daily sales
+    daily_sales = df.groupBy("date").agg(count("*").alias("sales_count"))
+    return daily_sales.orderBy(col("date").asc()).toPandas()
+
+# ----------- MARKET BASKET ANALYSIS -----------
+
+def prepare_basket(df):
+    # Group items per bill
+    bills = df.groupBy("bill_id").agg(
+        spark_sum("product").alias("items")
+    )
+    # For MB analysis, transform to list-of-lists format
+    basket_pdf = df.groupby("bill_id")["product"].apply(list).reset_index()
+    # One-hot encoding for mlxtend
+    all_products = pd.unique(df.select("product").toPandas()["product"])
+    basket_onehot = pd.DataFrame(0, index=basket_pdf["bill_id"], columns=all_products)
+    for idx, items in zip(basket_pdf["bill_id"], basket_pdf["product"]):
+        basket_onehot.loc[idx, items] = 1
+    return basket_onehot
+
+def run_market_basket(basket_onehot, min_support=0.01, min_confidence=0.3, top_n=10):
+    frequent_itemsets = apriori(basket_onehot, min_support=min_support, use_colnames=True)
+    rules = association_rules(frequent_itemsets, metric="confidence", min_threshold=min_confidence)
+    rules_sorted = rules.sort_values('lift', ascending=False).head(top_n)
+    summary = []
+    for _, row in rules_sorted.iterrows():
+        antecedents = ', '.join(list(row['antecedents']))
+        consequents = ', '.join(list(row['consequents']))
+        summary.append(
+            f"If a customer buys [{antecedents}], they are likely to also buy [{consequents}] "
+            f"(support: {row['support']:.3f}, confidence: {row['confidence']:.2f}, lift: {row['lift']:.2f})"
+        )
+    return "\n".join(summary)
+
+# ----------- CHATBOT LOGIC -----------
+
+def ask_llm(user_question, context):
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    messages = [
+        {"role": "system", "content": "You are a retail analytics assistant bot for small stores."},
+        {"role": "user", "content": user_question}
+    ]
+    data = {
+        "model": "gpt-3.5-turbo",  # Or use the free model you have access to
+        "messages": messages
+    }
+    try:
+        response = requests.post(OPENAI_API_URL, headers=headers, json=data)
+        response.raise_for_status()
+        result = response.json()
+        return result['choices'][0]['message']['content']
+    except Exception as e:
+        return f"Error calling LLM API: {e}"
+
+def chatbot_interface(spark, bills_df, basket_onehot, summary):
+    print("Welcome to BasketIQ Spark Bot! Type 'help' for options.")
+    while True:
+        user_input = input("\nYou: ").strip()
+        if user_input.lower() in ['exit', 'quit']:
+            print("Goodbye!")
+            break
+        elif user_input.lower() == 'help':
+            print("Options: sales summary, top sellers, sales by date, market basket, ask [your question], exit")
+        elif user_input.lower() == 'sales summary':
+            print(f"Total sales: {summary['total_sales']}")
+            print("Top products:")
+            print(summary['top_products'])
+        elif user_input.lower() == 'top sellers':
+            print(summary['top_products'])
+        elif user_input.lower() == 'sales by date':
+            print(sales_by_date(bills_df))
+        elif user_input.lower() == 'market basket':
+            print(run_market_basket(basket_onehot))
+        elif user_input.lower().startswith('ask '):
+            question = user_input[4:]
+            context = f"Sales summary: {summary['top_products'].to_dict()}"
+            answer = ask_llm(question, context)
+            print(f"Bot: {answer}")
+        else:
+            print("Unknown command. Type 'help' for options.")
+
+# ----------- MAIN APP LOGIC -----------
+
+def main(file_path):
+    spark = SparkSession.builder.appName("BasketIQ").getOrCreate()
+    bills_df = read_bills(spark, file_path)
+    summary = sales_summary(bills_df)
+    basket_onehot = prepare_basket(bills_df)
+    chatbot_interface(spark, bills_df, basket_onehot, summary)
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python BasketIQ_Spark_App.py bills.csv")
+        sys.exit(1)
+    main(sys.argv[1])
+
+# ------------------------------
+# Requirements:
+# - Python 3.8+
+# - pyspark, pandas, mlxtend, requests
+# Install with: pip install pyspark pandas mlxtend requests openpyxl
+# ------------------------------
